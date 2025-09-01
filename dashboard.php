@@ -91,7 +91,7 @@ function parseLogFile($logFile) {
                 
                 // Add to logs
                 $logs[] = [
-                    'time' => $timestamp,
+                    'time' => $timestamp, // This already contains the full timestamp format
                     'ip' => $ip,
                     'country_name' => $countryName,
                     'country' => $countryCode,
@@ -337,7 +337,7 @@ arsort($stats['detection_flags']);
         }
         
         /* Column widths - optimized for no horizontal scroll */
-        .col-time { width: 7%; }
+        .col-time { width: 12%; /* Increased width for full timestamp */ }
         .col-ip { width: 8%; }
         .col-country { width: 10%; }
         .col-city { width: 7%; }
